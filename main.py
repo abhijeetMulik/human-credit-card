@@ -4,10 +4,9 @@ import pickle
 import datetime
 import time
 import shutil
-import bcrypt
 
 import cv2
-from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, Body, Form
 from pydantic import BaseModel
 from typing import List, Annotated
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +15,7 @@ import starlette
 import models
 from database import engine, SessionLocal
 from sqlalchemy.orm import Session
+
 
 TRANSACTION_LOG_DIR = './logs'
 DB_PATH = './db'
@@ -28,9 +28,9 @@ models.Base.metadata.create_all(bind=engine)  # create all tables in postgresql
 
 class User(BaseModel):
     email: str
-    password: str
     picture_embeddings: str
     security_pin: int
+    name: str
 
 class Transaction(BaseModel):
     transaction_date: datetime.date
@@ -55,8 +55,90 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+@app.post("/profile/registration")
+async def profile_registration(db: db_dependency, firstName: str = Form(...), email: str = Form(...),
+                         imageData: UploadFile = File(...), securityPin: str = Form(...)):
+    if email is None or securityPin is None:
+        raise HTTPException(status_code=401, detail="Invalid user credentials")
+    user_exists = db.query(models.Users).filter(models.Users.email == email).first()
+    if user_exists:
+        raise HTTPException(status_code=404, detail='User already exists.')
+
+    imageData.filename = f"{uuid.uuid4()}.png"
+    contents = await imageData.read()
+
+    # save the file
+    with open(imageData.filename, "wb") as f:
+        f.write(contents)
+
+    embeddings = face_recognition.face_encodings(cv2.imread(imageData.filename))
+
+    unique_filename = uuid.uuid4()  # Generate a UUID (Universally Unique Identifier)
+
+    # hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
+    db_insert = models.Users(email=email, picture_embeddings= unique_filename, name=firstName , security_pin=securityPin)
+    db.add(db_insert)
+    db.commit()
+
+    unique_filename = f"{unique_filename}.pickle"
+
+    file_ = open(os.path.join(DB_PATH, unique_filename), 'wb')
+    pickle.dump(embeddings, file_)
+    os.remove(imageData.filename)
+    return {"message": "Registration successful", 'status_code': 200}
+
+
+
+@app.post("/register_new_user")
+async def register_new_user(db: db_dependency,
+                         imageData: UploadFile = File(...)):
+    imageData.filename = f"{uuid.uuid4()}.png"
+    contents = await imageData.read()
+
+    # example of how you can save the file
+    with open(imageData.filename, "wb") as f:
+        f.write(contents)
+
+    shutil.copy(imageData.filename, os.path.join(DB_PATH, 'nikhil.png'))
+
+    return {'registration_status': 200}
+
+
+
+
+# login test
+
 @app.post("/login")
-async def login(db: db_dependency, file: UploadFile = File(...)):
+async def login(db: db_dependency, imageData: UploadFile = File(...), securityPin: str = Form(...)):
+
+    imageData.filename = f"{uuid.uuid4()}.png"
+    contents = await imageData.read()
+
+    #save the file
+    with open(imageData.filename, "wb") as f:
+        f.write(contents)
+
+    user_name, match_status = recognize(cv2.imread(imageData.filename))
+
+    result = db.query(models.Users).filter(models.Users.picture_embeddings == user_name, models.Users.security_pin == securityPin).first()
+    if not result:
+        print('Invalid credentials. Try again !')
+        return {'user': 'User Not Found', 'status_code': 300,}
+        # raise HTTPException(status_code=404, detail='Invalid credentials. Try again !')
+
+    now = datetime.datetime.now()  # Get current date and time
+    formatted_date = now.strftime("%B %d, %Y %I:%M:%S %p")  # Format according to specifications
+    # print(formatted_date)  # Output: April 07, 2022 11:24:35 AM (example)
+
+    await insert_transaction(db, result.email, formatted_date, 50.0)
+    os.remove(imageData.filename)
+        # print('email : ***********************', result.email)
+
+    return {'user': result.name, 'status_code': 200, 'result': result}
+    # return {'user': result, 'match_status': match_status}
+
+@app.post("/login_test")
+async def login(db: db_dependency, file: UploadFile = File(...), securityPin: str = Form(...)):
 
     file.filename = f"{uuid.uuid4()}.png"
     contents = await file.read()
@@ -67,86 +149,37 @@ async def login(db: db_dependency, file: UploadFile = File(...)):
 
     user_name, match_status = recognize(cv2.imread(file.filename))
 
-    if match_status:
-        epoch_time = time.time()
-        date = time.strftime('%Y%m%d', time.localtime(epoch_time))
-        with open(os.path.join(TRANSACTION_LOG_DIR, '{}.csv'.format(date)), 'a') as f:
-            f.write('{},{},{}\n'.format(user_name, datetime.datetime.now(), 'IN'))
-            f.close()
-
-    result = db.query(models.Users).filter(models.Users.picture_embeddings == user_name).first()
+    # result = db.query(models.Users).filter(models.Users.picture_embeddings == user_name).first()
+    result = db.query(models.Users).filter(models.Users.picture_embeddings == user_name,
+                                           models.Users.security_pin == securityPin).first()
     if not result:
         raise HTTPException(status_code=404, detail='User not found')
 
     return {'user': result.name, 'filename': user_name}
     # return {'user': result, 'match_status': match_status}
 
-@app.post("/register_new_user")
-async def register_new_user(db: db_dependency ,file: UploadFile = File(...), text=None, security_pin=None, email=None):  # security_pin, card number, cvv pin
 
-    file.filename = f"{uuid.uuid4()}.png"
-    contents = await file.read()
 
-    # save the file
-    with open(file.filename, "wb") as f:
-        f.write(contents)
 
-    embeddings = face_recognition.face_encodings(cv2.imread(file.filename))
-
-    unique_filename = uuid.uuid4()  # Generate a UUID (Universally Unique Identifier)
-
-    db_insert = models.Users(email=email, name= text, picture_embeddings= unique_filename, security_pin= security_pin, password= 'password')
-    db.add(db_insert)
-    db.commit()
-
-    unique_filename = f"{unique_filename}.pickle"
-
-    file_ = open(os.path.join(DB_PATH, unique_filename), 'wb')
-    pickle.dump(embeddings, file_)
-    os.remove(file.filename)
-
-    return {'registration_status': 200}
-
-@app.post("/insert_transaction")
-async def insert_transaction(db: db_dependency ,user_email, transaction_date, total_payment= 0.0):
+# @app.post("/insert_transaction")
+async def insert_transaction(db,user_email, transaction_date, total_payment= 0.0):
     db_insert = models.Transactions(user_email=user_email, transaction_date= transaction_date, total_payment= total_payment)
     db.add(db_insert)
     db.commit()
     return {'transaction inserted successfully': 200}
 
-@app.post("/profile_login")
-async def profile_login(db: db_dependency, user_email=None, password=None):
-    if not user_email or not password:
-        raise HTTPException(status_code=400, detail="Email and password are required.")
-
-    user = db.query(models.Users).filter(models.Users.email == user_email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-
-    # Check if the entered password matches the stored hashed password
-    if bcrypt.checkpw(password.encode('utf-8'), user.password):
-        return {"message": "Login successful!"}
-    else:
-        raise HTTPException(status_code=401, detail="Incorrect password.")
-
-@app.post("/profile_registration")
-async def profile_registration(db: db_dependency, user_email=None, password=None):
-    if user_email is None or password is None:
-        raise HTTPException(status_code=401, detail="Invalid user credentials")
-    user_exists = db.query(models.Users).filter(models.Users.email == user_email).first()
-    if user_exists:
-        raise HTTPException(status_code=404, detail='User already exists.')
-    hashed_password = bcrypt.hashpw(password.encode('utf-8'), bcrypt.gensalt())
-    db_insert = models.Users(email=user_email, password=hashed_password)
-    db.add(db_insert)
-    db.commit()
-    return {"message": "Registration successful"}
-
 @app.get("/get_transaction_history")
-async def transaction_history(db: db_dependency ,user_emai):
-    result = db.query(models.Transactions).filter(models.Transactions.user_email == user_emai).all()
+async def transaction_history(db: db_dependency, user_email, security_pin):
+    result = db.query(models.Transactions) \
+               .join(models.Users, models.Transactions.user_email == models.Users.email) \
+               .filter(models.Transactions.user_email == user_email, models.Users.security_pin == security_pin) \
+               .all()
+
     if not result:
-        raise HTTPException(status_code=404, detail='Zero transactions found')
+        raise HTTPException(status_code=404, detail='Zero transactions found or invalid credentials')
+
+    print('transaction history is: ', str(result))
+
     return result
 
 @app.get("/get_transaction_logs")
@@ -190,3 +223,18 @@ def recognize(img):
         return db_dir[j - 1][:-7], True
     else:
         return 'unknown_person', False
+
+# @app.post("/profile/login")
+# async def profile_login(db: db_dependency, user_email=None, password=None):
+#     if not user_email or not password:
+#         raise HTTPException(status_code=400, detail="Email and password are required.")
+#
+#     user = db.query(models.Users).filter(models.Users.email == user_email).first()
+#     if not user:
+#         raise HTTPException(status_code=404, detail="User not found.")
+#
+#     # Check if the entered password matches the stored hashed password
+#     if bcrypt.checkpw(password.encode('utf-8'), user.password):
+#         return {"message": "Login successful!"}
+#     else:
+#         raise HTTPException(status_code=401, detail="Incorrect password.")
